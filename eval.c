@@ -11,6 +11,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define CRUSTIK_ARM_NEON 1
+#else
+#define CRUSTIK_ARM_NEON 0
+#endif
+
 #define ALIGN64 __attribute__((aligned(64)))
 
 #ifndef EVALFILE
@@ -97,28 +104,63 @@ static inline int nnue_inputIndex(int persp, int pieceIsOwn, int internal_piece,
 
 static inline void nnue_addFeature(int16_t acc[NNUE_HL], int input_index) {
 	const int16_t *w = nnue_featureWeights[input_index];
+#if CRUSTIK_ARM_NEON
+	for (int h = 0; h < NNUE_HL; h += 8) {
+		int16x8_t va = vld1q_s16(acc + h);
+		int16x8_t vw = vld1q_s16(w + h);
+		vst1q_s16(acc + h, vaddq_s16(va, vw));
+	}
+#else
 	for (int h = 0; h < NNUE_HL; h++)
 		acc[h] += w[h];
+#endif
 }
 
 static inline void nnue_addSub(int16_t *dst, const int16_t *src,
 							   const int16_t *a, const int16_t *s) {
+#if CRUSTIK_ARM_NEON
+	for (int i = 0; i < NNUE_HL; i += 8) {
+		int16x8_t v = vaddq_s16(vld1q_s16(src + i), vld1q_s16(a + i));
+		v = vsubq_s16(v, vld1q_s16(s + i));
+		vst1q_s16(dst + i, v);
+	}
+#else
 	for (int i = 0; i < NNUE_HL; i++)
 		dst[i] = src[i] + a[i] - s[i];
+#endif
 }
 
 static inline void nnue_addSubSub(int16_t *dst, const int16_t *src,
-								  const int16_t *a, const int16_t *s1,
-								  const int16_t *s2) {
+							  const int16_t *a, const int16_t *s1,
+							  const int16_t *s2) {
+#if CRUSTIK_ARM_NEON
+	for (int i = 0; i < NNUE_HL; i += 8) {
+		int16x8_t v = vaddq_s16(vld1q_s16(src + i), vld1q_s16(a + i));
+		v = vsubq_s16(v, vld1q_s16(s1 + i));
+		v = vsubq_s16(v, vld1q_s16(s2 + i));
+		vst1q_s16(dst + i, v);
+	}
+#else
 	for (int i = 0; i < NNUE_HL; i++)
 		dst[i] = src[i] + a[i] - s1[i] - s2[i];
+#endif
 }
 
 static inline void nnue_addSubAddSub(int16_t *dst, const int16_t *src,
-									 const int16_t *a1, const int16_t *s1,
-									 const int16_t *a2, const int16_t *s2) {
+								 const int16_t *a1, const int16_t *s1,
+								 const int16_t *a2, const int16_t *s2) {
+#if CRUSTIK_ARM_NEON
+	for (int i = 0; i < NNUE_HL; i += 8) {
+		int16x8_t v = vaddq_s16(vld1q_s16(src + i), vld1q_s16(a1 + i));
+		v = vsubq_s16(v, vld1q_s16(s1 + i));
+		v = vaddq_s16(v, vld1q_s16(a2 + i));
+		v = vsubq_s16(v, vld1q_s16(s2 + i));
+		vst1q_s16(dst + i, v);
+	}
+#else
 	for (int i = 0; i < NNUE_HL; i++)
 		dst[i] = src[i] + a1[i] - s1[i] + a2[i] - s2[i];
+#endif
 }
 
 static void nnue_buildSide(Position *board, int ownSide, int16_t acc[NNUE_HL],
@@ -257,7 +299,7 @@ void nnue_update(ThreadData *td, Position *board, uint16_t move, int parent_ply,
 			nnue_addSubSub(dst, src, nnue_featureWeights[addIdx[0]],
 						   nnue_featureWeights[subIdx[0]],
 						   nnue_featureWeights[subIdx[1]]);
-		else 
+		else
 			nnue_addSubAddSub(dst, src, nnue_featureWeights[addIdx[0]],
 							  nnue_featureWeights[subIdx[0]],
 							  nnue_featureWeights[addIdx[1]],
@@ -273,6 +315,46 @@ static int nnue_forward(ThreadData *td, Position *board, int ply) {
 	const int16_t *accThem = td->nnue_stack[ply].vector[board->turn ^ 1];
 
 	int s = 0;
+#if CRUSTIK_ARM_NEON
+	/*
+	 * Preserve the original quantized arithmetic exactly:
+	 *   term = (int16_t)(activation * weight) * activation
+	 * vmulq_s16 intentionally keeps the low 16 bits, just like the cast in
+	 * the scalar implementation. Widen only after that truncation.
+	 *
+	 * Each vector accumulator lane receives 96 iterations, each bounded by
+	 * 2 * 32768 * 255, so its signed 32-bit accumulation cannot overflow.
+	 * The final lane reduction is performed modulo 2^32 to retain the
+	 * two's-complement result of the original int accumulator on AArch64.
+	 */
+	const int16x8_t zero = vdupq_n_s16(0);
+	const int16x8_t max_activation = vdupq_n_s16(HIDDEN_QUANT_SCALE);
+	int32x4_t sum_low = vdupq_n_s32(0);
+	int32x4_t sum_high = vdupq_n_s32(0);
+	for (int h = 0; h < NNUE_HL; h += 8) {
+		int16x8_t us = vmaxq_s16(vminq_s16(vld1q_s16(accUs + h), max_activation), zero);
+		int16x8_t them = vmaxq_s16(vminq_s16(vld1q_s16(accThem + h), max_activation), zero);
+		int16x8_t us_product = vmulq_s16(us, vld1q_s16(nnue_outputWeights + h));
+		int16x8_t them_product = vmulq_s16(them, vld1q_s16(nnue_outputWeights + NNUE_HL + h));
+		int32x4_t low = vaddq_s32(
+			vmull_s16(vget_low_s16(us_product), vget_low_s16(us)),
+			vmull_s16(vget_low_s16(them_product), vget_low_s16(them)));
+		int32x4_t high = vaddq_s32(
+			vmull_s16(vget_high_s16(us_product), vget_high_s16(us)),
+			vmull_s16(vget_high_s16(them_product), vget_high_s16(them)));
+		sum_low = vaddq_s32(sum_low, low);
+		sum_high = vaddq_s32(sum_high, high);
+	}
+	int32_t lanes[8];
+	vst1q_s32(lanes, sum_low);
+	vst1q_s32(lanes + 4, sum_high);
+	uint32_t sum_bits = (uint32_t)lanes[0] + (uint32_t)lanes[1] +
+		(uint32_t)lanes[2] + (uint32_t)lanes[3] + (uint32_t)lanes[4] +
+		(uint32_t)lanes[5] + (uint32_t)lanes[6] + (uint32_t)lanes[7];
+	int32_t signed_sum;
+	memcpy(&signed_sum, &sum_bits, sizeof(signed_sum));
+	s = (int)signed_sum;
+#else
 	for (int h = 0; h < NNUE_HL; h++) {
 		int c = accUs[h];
 		c = c < 0 ? 0 : (c > HIDDEN_QUANT_SCALE ? HIDDEN_QUANT_SCALE : c);
@@ -282,6 +364,7 @@ static int nnue_forward(ThreadData *td, Position *board, int ply) {
 		c = c < 0 ? 0 : (c > HIDDEN_QUANT_SCALE ? HIDDEN_QUANT_SCALE : c);
 		s += (int16_t)(c * nnue_outputWeights[NNUE_HL + h]) * c;
 	}
+#endif
 
 	long long out = s / HIDDEN_QUANT_SCALE + nnue_outputBias;
 	out =
