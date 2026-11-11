@@ -1,0 +1,91 @@
+name: Build Crustik for Android ARM64 NEON
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Android ARM64 NEON
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Cache Android NDK r27c
+        id: android-ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/android-ndk-r27c
+          key: android-ndk-r27c-linux-x86_64-27.2.12479018
+
+      - name: Download and verify Android NDK r27c
+        if: steps.android-ndk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 3 --retry-delay 2 \
+            https://dl.google.com/android/repository/android-ndk-r27c-linux.zip \
+            -o android-ndk-r27c-linux.zip
+          echo '090e8083a715fdb1a3e402d0763c388abb03fb4e  android-ndk-r27c-linux.zip' | sha1sum -c -
+          unzip -q android-ndk-r27c-linux.zip
+          test -f android-ndk-r27c/source.properties
+          grep -q 'Pkg.Revision = 27.2.12479018' android-ndk-r27c/source.properties
+
+      - name: Set Android NDK path
+        shell: bash
+        run: echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: Verify compiler target
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          "$CC" --version
+          printf '' | "$CC" -dM -E - | grep -E '^#define (__aarch64__|__ARM_NEON) '
+
+      - name: Build ARM64 NEON engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          make clean
+          make -j2 CC="$CC" NATIVE=0 ARCH=-march=armv8-a+simd LTO=
+          test -s crustik
+          file crustik
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h crustik | grep -E 'Class:|Machine:'
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h crustik | grep -q 'AArch64'
+
+      - name: Verify real NEON instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          OBJDUMP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump"
+          "$OBJDUMP" -d eval.o > eval.dis
+          # The explicit NNUE kernels must compile to Advanced SIMD operations.
+          grep -Eq '\b(mul|smull|smull2|saddw|ssubl|add|sub)\s+v[0-9]+\.' eval.dis || {
+            echo 'ERROR: expected AArch64 NEON vector instructions were not found in eval.o' >&2
+            exit 1
+          }
+          echo 'PASS: AArch64 NEON vector instructions found in eval.o.'
+          # Dotprod is intentionally not enabled: the model uses int16 weights
+          # and requires a per-neuron modulo-16-bit product before accumulation.
+
+      - name: Strip debug symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded crustik
+          test -s crustik
+          sha256sum crustik
+          ls -lh crustik
+
+      - name: Upload Android engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crustik-Android-ARM64-NEON
+          path: crustik
+          if-no-files-found: error
