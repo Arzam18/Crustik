@@ -15,6 +15,10 @@
 #include <immintrin.h>
 #define NNUE_USE_AVX2 1
 _Static_assert(NNUE_HL % 16 == 0, "NNUE_HL must be a multiple of 16 for AVX2");
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define NNUE_USE_NEON 1
+_Static_assert(NNUE_HL % 8 == 0, "NNUE_HL must be a multiple of 8 for NEON");
 #endif
 
 #define ALIGN64 __attribute__((aligned(64)))
@@ -163,6 +167,46 @@ static inline void nnue_addSubAddSub(int16_t *dst, const int16_t *src,
 	}
 }
 
+#elif defined(NNUE_USE_NEON)
+
+static inline void nnue_addSub(int16_t *dst, const int16_t *src,
+							   const int16_t *a, const int16_t *s)
+{
+	for (int i = 0; i < NNUE_HL; i += 8)
+	{
+		int16x8_t v = vaddq_s16(vld1q_s16(src + i), vld1q_s16(a + i));
+		v = vsubq_s16(v, vld1q_s16(s + i));
+		vst1q_s16(dst + i, v);
+	}
+}
+
+static inline void nnue_addSubSub(int16_t *dst, const int16_t *src,
+							  const int16_t *a, const int16_t *s1,
+							  const int16_t *s2)
+{
+	for (int i = 0; i < NNUE_HL; i += 8)
+	{
+		int16x8_t v = vaddq_s16(vld1q_s16(src + i), vld1q_s16(a + i));
+		v = vsubq_s16(v, vld1q_s16(s1 + i));
+		v = vsubq_s16(v, vld1q_s16(s2 + i));
+		vst1q_s16(dst + i, v);
+	}
+}
+
+static inline void nnue_addSubAddSub(int16_t *dst, const int16_t *src,
+							 const int16_t *a1, const int16_t *s1,
+							 const int16_t *a2, const int16_t *s2)
+{
+	for (int i = 0; i < NNUE_HL; i += 8)
+	{
+		int16x8_t v = vaddq_s16(vld1q_s16(src + i), vld1q_s16(a1 + i));
+		v = vsubq_s16(v, vld1q_s16(s1 + i));
+		v = vaddq_s16(v, vld1q_s16(a2 + i));
+		v = vsubq_s16(v, vld1q_s16(s2 + i));
+		vst1q_s16(dst + i, v);
+	}
+}
+
 #else // scalar fallback
 
 static inline void nnue_addSub(int16_t *dst, const int16_t *src,
@@ -188,6 +232,19 @@ static inline void nnue_addSubAddSub(int16_t *dst, const int16_t *src,
 		dst[i] = src[i] + a1[i] - s1[i] + a2[i] - s2[i];
 }
 
+#endif
+
+#ifdef NNUE_USE_NEON
+static inline void nnue_addFeature(int16_t acc[NNUE_HL], int input_index)
+{
+	const int16_t *w = nnue_featureWeights[input_index];
+	for (int h = 0; h < NNUE_HL; h += 8)
+	{
+		int16x8_t va = vld1q_s16(acc + h);
+		int16x8_t vw = vld1q_s16(w + h);
+		vst1q_s16(acc + h, vaddq_s16(va, vw));
+	}
+}
 #endif
 
 #ifdef NNUE_USE_AVX2
@@ -247,6 +304,10 @@ static void nnue_buildSide(Position *board, int ownSide, int16_t acc[NNUE_HL],
 			v += nnue_featureWeights[features[f]][base];
 		acc[base] = v;
 	}
+#elif defined(NNUE_USE_NEON)
+	memcpy(acc, nnue_hiddenBiases, sizeof(nnue_hiddenBiases));
+	for (int f = 0; f < nfeat; f++)
+		nnue_addFeature(acc, features[f]);
 #else
 	memcpy(acc, nnue_hiddenBiases, sizeof(nnue_hiddenBiases));
 	for (int f = 0; f < nfeat; f++)
@@ -471,6 +532,46 @@ static int nnue_forward(ThreadData *td, Position *board, int ply)
 	}
 
 	s = nnue_hsum_epi32(sum);
+#elif defined(NNUE_USE_NEON)
+	/*
+	 * Preserve the original quantized arithmetic exactly:
+	 *   term = (int16_t)(activation * weight) * activation
+	 * vmulq_s16 keeps the low 16 bits before widening, matching the scalar
+	 * cast. The 32-bit lane reduction intentionally wraps modulo 2^32.
+	 */
+	const int16x8_t zero = vdupq_n_s16(0);
+	const int16x8_t max_activation = vdupq_n_s16(HIDDEN_QUANT_SCALE);
+	int32x4_t sum_low = vdupq_n_s32(0);
+	int32x4_t sum_high = vdupq_n_s32(0);
+	for (int h = 0; h < NNUE_HL; h += 8)
+	{
+		int16x8_t us = vmaxq_s16(
+			vminq_s16(vld1q_s16(accUs + h), max_activation), zero);
+		int16x8_t them = vmaxq_s16(
+			vminq_s16(vld1q_s16(accThem + h), max_activation), zero);
+		int16x8_t us_product = vmulq_s16(
+			us, vld1q_s16(nnue_outputWeights + h));
+		int16x8_t them_product = vmulq_s16(
+			them, vld1q_s16(nnue_outputWeights + NNUE_HL + h));
+		int32x4_t low = vaddq_s32(
+			vmull_s16(vget_low_s16(us_product), vget_low_s16(us)),
+			vmull_s16(vget_low_s16(them_product), vget_low_s16(them)));
+		int32x4_t high = vaddq_s32(
+			vmull_s16(vget_high_s16(us_product), vget_high_s16(us)),
+			vmull_s16(vget_high_s16(them_product), vget_high_s16(them)));
+		sum_low = vaddq_s32(sum_low, low);
+		sum_high = vaddq_s32(sum_high, high);
+	}
+	int32_t lanes[8];
+	vst1q_s32(lanes, sum_low);
+	vst1q_s32(lanes + 4, sum_high);
+	uint32_t sum_bits = (uint32_t)lanes[0] + (uint32_t)lanes[1] +
+		(uint32_t)lanes[2] + (uint32_t)lanes[3] +
+		(uint32_t)lanes[4] + (uint32_t)lanes[5] +
+		(uint32_t)lanes[6] + (uint32_t)lanes[7];
+	int32_t signed_sum;
+	memcpy(&signed_sum, &sum_bits, sizeof(signed_sum));
+	s = (int)signed_sum;
 #else
 	s = 0;
 	for (int h = 0; h < NNUE_HL; h++)
